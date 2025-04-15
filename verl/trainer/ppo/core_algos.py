@@ -149,6 +149,47 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+
+def compute_star_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   response_mask: torch.Tensor,
+                                   index: np.ndarray,
+                                   star_coef: float = 1.0):
+    """ Compute advantage for STAR, which only considers positive reward.
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        index: `(np.ndarray)`
+            Shape: (bs,). Prompt indices used for grouping rewards.
+        star_coef: `(float)`
+            Coefficient for STAR rewards. Used in star_passk mode.
+        epsilon: `(float)`
+            Small constant for numerical stability.
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)  # Sum rewards for each sequence
+    pos_mask = scores > 0  # Mask for positive rewards only
+
+    with torch.no_grad():
+        # Compute advantages directly from rewards for positive examples
+        advantages = torch.zeros_like(scores)
+        for i in range(len(scores)):
+            if pos_mask[i]:
+                advantages[i] = scores[i] * star_coef * (scores[i] ** (star_coef - 1))
+
+        # Expand advantages to token level and mask
+        advantages = advantages.unsqueeze(-1) * response_mask
+        advantages = advantages * pos_mask.unsqueeze(-1)  # Zero out advantages for non-positive rewards
+
+    return advantages, advantages
+
+
 def compute_reinforce_plus_plus_baseline_outcome_advantage(token_level_rewards: torch.Tensor,
                                                            response_mask: torch.Tensor,
                                                            index: torch.Tensor,

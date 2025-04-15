@@ -182,6 +182,7 @@ custom_reward_function:
 algorithm:
   gamma: 1.0
   lam: 1.0
+  star_coef: 1.0
   adv_estimator: gae
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence

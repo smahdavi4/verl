@@ -73,6 +73,7 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS_BASELINE = 'reinforce_plus_plus_baseline'
     REMAX = 'remax'
     RLOO = 'rloo'
+    STAR = 'star'
 
 
 @dataclass
@@ -174,7 +175,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, star_coef=1.0):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch['response_mask'] = compute_response_mask(data)
@@ -188,6 +189,14 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_mask=data.batch['response_mask'],
             gamma=gamma,
             lam=lam)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.STAR:
+        advantages, returns = core_algos.compute_star_outcome_advantage(
+            token_level_rewards=data.batch['token_level_rewards'],
+            response_mask=data.batch['response_mask'],
+            index=data.non_tensor_batch['uid'],
+            star_coef=star_coef)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.GRPO:
@@ -285,7 +294,7 @@ class RayPPOTrainer(object):
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
                 AdvantageEstimator.GRPO, AdvantageEstimator.REINFORCE_PLUS_PLUS, AdvantageEstimator.REMAX,
-                AdvantageEstimator.RLOO, AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE
+                AdvantageEstimator.RLOO, AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE, AdvantageEstimator.STAR
         ]:
             self.use_critic = False
         else:
@@ -940,6 +949,7 @@ class RayPPOTrainer(object):
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
+                                                  star_coef=self.config.algorithm.star_coef,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
