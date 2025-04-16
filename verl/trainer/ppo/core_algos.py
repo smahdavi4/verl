@@ -153,8 +153,10 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
 def compute_star_outcome_advantage(token_level_rewards: torch.Tensor,
                                    response_mask: torch.Tensor,
                                    index: np.ndarray,
-                                   star_coef: float = 1.0):
-    """ Compute advantage for STAR, which only considers positive reward.
+                                   star_coef: float = 1.0,
+                                   epsilon: float = 1e-6):
+    """
+    Compute advantage for STAR, which only considers positive reward.
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape: (bs, response_length)
@@ -173,19 +175,34 @@ def compute_star_outcome_advantage(token_level_rewards: torch.Tensor,
         returns: `(torch.Tensor)`
             shape: (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)  # Sum rewards for each sequence
+    scores = token_level_rewards.sum(dim=-1)
     pos_mask = scores > 0  # Mask for positive rewards only
 
-    with torch.no_grad():
-        # Compute advantages directly from rewards for positive examples
-        advantages = torch.zeros_like(scores)
-        for i in range(len(scores)):
-            if pos_mask[i]:
-                advantages[i] = scores[i] * star_coef * (scores[i] ** (star_coef - 1))
+    id2score = defaultdict(list)
+    id2mean = {}
 
-        # Expand advantages to token level and mask
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        # Calculate mean scores per prompt
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        # Compute advantages
+        advantages = torch.zeros_like(scores)
+        for i in range(bsz):
+            if pos_mask[i]:
+                advantages[i] = scores[i] * star_coef * ((1 - id2mean[index[i]]) ** (star_coef - 1))
+
+        # Expand to token level and apply masks
         advantages = advantages.unsqueeze(-1) * response_mask
-        advantages = advantages * pos_mask.unsqueeze(-1)  # Zero out advantages for non-positive rewards
+        advantages = advantages * pos_mask.unsqueeze(-1)
 
     return advantages, advantages
 
