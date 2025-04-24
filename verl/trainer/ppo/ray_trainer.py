@@ -175,7 +175,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, star_coef=1.0):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, star_coef=1.0, normalize_star=False):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch['response_mask'] = compute_response_mask(data)
@@ -196,14 +196,19 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             token_level_rewards=data.batch['token_level_rewards'],
             response_mask=data.batch['response_mask'],
             index=data.non_tensor_batch['uid'],
-            star_coef=star_coef)
+            star_coef=star_coef,
+            normalize_star=normalize_star,
+            )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.GRPO:
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             response_mask=data.batch['response_mask'],
-            index=data.non_tensor_batch['uid'])
+            index=data.non_tensor_batch['uid'],
+            star_coef=star_coef,
+            normalize_star=normalize_star,
+            )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE:
@@ -818,6 +823,10 @@ class RayPPOTrainer(object):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # init best‐ckpt tracking if requested
+        if self.config.trainer.save_best_ckpt:
+            self.best_score = None
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
@@ -950,6 +959,7 @@ class RayPPOTrainer(object):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   star_coef=self.config.algorithm.star_coef,
+                                                  normalize_star=self.config.algorithm.normalize_star,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
@@ -974,12 +984,40 @@ class RayPPOTrainer(object):
                             val_metrics: dict = self._validate()
                             if is_last_step:
                                 last_val_metrics = val_metrics
+
+                        # save best‐ckpt logic
+                        if self.config.trainer.save_best_ckpt:
+                            # pick which metric exists
+                            for key in (
+                                "val-core/exact_boxed/acc/mean@1",
+                                "val-core/numina_aops_forum/reward/mean@1",
+                            ):
+                                if key in val_metrics:
+                                    score = val_metrics[key]
+                                    break
+                            else:
+                                raise ValueError(
+                                    "None of the required val-core metrics found for best‐ckpt"
+                                )
+                            # update and save
+                            if self.best_score is None or score > self.best_score:
+                                self.best_score = score
+                                # save checkpoint and record iteration
+                                self._save_checkpoint()
+                                best_file = os.path.join(
+                                    self.config.trainer.default_local_dir,
+                                    "best_checkpointed_iteration.txt",
+                                )
+                                with open(best_file, "w") as f:
+                                    f.write(str(self.global_steps))
+
                         metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and ( is_last_step or \
                             self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+                        if not self.config.trainer.save_best_ckpt:
+                            with _timer('save_checkpoint', timing_raw):
+                                self._save_checkpoint()
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

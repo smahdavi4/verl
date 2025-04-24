@@ -102,29 +102,21 @@ def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torc
         advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
 
-
-# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
-def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
-                                   response_mask: torch.Tensor,
-                                   index: np.ndarray,
-                                   epsilon: float = 1e-6):
+def _compute_id2_mean_std(scores: torch.Tensor, index: np.ndarray):
     """
-    Compute advantage for GRPO, operating only on Outcome reward 
-    (with only one scalar reward for each response).
+    Compute mean and std for each prompt index.
     Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
+        scores: `(torch.Tensor)`
+            shape: (bs,)
+        index: `(np.ndarray)`
+            Shape: (bs,). Prompt indices used for grouping rewards.
     
     Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
+        id2mean: `(dict)`
+            Dictionary mapping prompt index to mean reward.
+        id2std: `(dict)`
+            Dictionary mapping prompt index to std reward.
     """
-    scores = token_level_rewards.sum(dim=-1)
-
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
@@ -142,8 +134,72 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                 id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+    return id2mean, id2std
+
+def _compute_per_sample_star_coefs(id2mean, index, star_coef, normalize_star, scores, estimator):
+    assert estimator in ['grpo', 'star'], f"Invalid estimator: {estimator}. Must be 'grpo' or 'star'."
+    star_coefs = []
+    star_coefs_sum = 0
+    is_sample_active = []
+    for i in range(len(index)):
+        # Active samples
+        if 1 > id2mean[index[i]] > 0 and ((estimator == 'grpo') or (estimator == 'star' and scores[i] > 0)):
+            star_coefs.append(star_coef * ((1 - id2mean[index[i]]) ** (star_coef - 1)))
+            star_coefs_sum += star_coefs[-1]
+            is_sample_active.append(True)
+        else:
+            star_coefs.append(1)
+            is_sample_active.append(False)
+    mult_coefs = []
+    n_active_samples = sum(is_sample_active)
+    for i in range(len(index)):
+        if star_coef > 1 and is_sample_active[i]:
+            mult_coefs.append(star_coefs[i])
+            if normalize_star:
+                mult_coefs[i] *= n_active_samples / star_coefs_sum
+        else:
+            mult_coefs.append(1)
+    return mult_coefs
+
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   response_mask: torch.Tensor,
+                                   index: np.ndarray,
+                                   epsilon: float = 1e-6,
+                                   star_coef: float = 1.0,
+                                   normalize_star: bool = False):
+    """
+    Compute advantage for GRPO, operating only on Outcome reward 
+    (with only one scalar reward for each response).
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    # assert everything is between 0 and 1
+    assert torch.all(scores >= 0) and torch.all(scores <= 1), f"Scores should be between 0 and 1, but got {scores}, to support other reward types, please implement the star_coef for it."
+
+    bsz = scores.shape[0]
+    id2mean, id2std = _compute_id2_mean_std(scores, index)
+
+    with torch.no_grad():
+        # Compute star coefficients for each sample
+        if star_coef > 1:
+            mult_coefs = _compute_per_sample_star_coefs(id2mean, index, star_coef, normalize_star, scores, 'grpo')
+
         for i in range(bsz):
             scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            if star_coef > 1:
+                scores[i] = scores[i] * mult_coefs[i]
+                
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -154,6 +210,7 @@ def compute_star_outcome_advantage(token_level_rewards: torch.Tensor,
                                    response_mask: torch.Tensor,
                                    index: np.ndarray,
                                    star_coef: float = 1.0,
+                                   normalize_star: bool = False,
                                    epsilon: float = 1e-6):
     """
     Compute advantage for STAR, which only considers positive reward.
@@ -178,27 +235,21 @@ def compute_star_outcome_advantage(token_level_rewards: torch.Tensor,
     scores = token_level_rewards.sum(dim=-1)
     pos_mask = scores > 0  # Mask for positive rewards only
 
-    id2score = defaultdict(list)
-    id2mean = {}
+    id2mean, _ = _compute_id2_mean_std(scores, index)
 
     with torch.no_grad():
         bsz = scores.shape[0]
-        # Calculate mean scores per prompt
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-
+        if star_coef > 1:
+            # Compute star coefficients for each sample
+            mult_coefs = _compute_per_sample_star_coefs(id2mean, index, star_coef, normalize_star, scores, 'star')
         # Compute advantages
         advantages = torch.zeros_like(scores)
         for i in range(bsz):
             if pos_mask[i]:
-                advantages[i] = scores[i] * star_coef * ((1 - id2mean[index[i]]) ** (star_coef - 1))
+                if star_coef > 1:
+                    advantages[i] = scores[i] * mult_coefs[i] * ((1 - id2mean[index[i]]) ** (star_coef - 1))
+                else:
+                    advantages[i] = scores[i]
 
         # Expand to token level and apply masks
         advantages = advantages.unsqueeze(-1) * response_mask
