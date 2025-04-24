@@ -143,12 +143,13 @@ def _compute_per_sample_star_coefs(id2mean, index, star_coef, normalize_star, sc
     is_sample_active = []
     for i in range(len(index)):
         # Active samples
-        if 1 > id2mean[index[i]] > 0 and ((estimator == 'grpo') or (estimator == 'star' and scores[i] > 0)):
+        if ((estimator == 'grpo' and 1 > id2mean[index[i]] > 0) or (estimator == 'star' and scores[i] > 0)):
             star_coefs.append(star_coef * ((1 - id2mean[index[i]]) ** (star_coef - 1)))
             star_coefs_sum += star_coefs[-1]
             is_sample_active.append(True)
         else:
-            star_coefs.append(1)
+            # Zero out inactive samples
+            star_coefs.append(0)
             is_sample_active.append(False)
     mult_coefs = []
     n_active_samples = sum(is_sample_active)
