@@ -825,7 +825,26 @@ class RayPPOTrainer(object):
 
         # init best‐ckpt tracking if requested
         if self.config.trainer.save_best_ckpt:
-            self.best_score = None
+            # If we are resuming from a checkpoint, we need to get the best score from the checkpoint
+            # to do this, we need to re-evaluate the best score
+            if self.global_steps > 0:
+                val_metrics = self._validate()
+                # Same logic as in the training loop
+                for key in (
+                    "val-core/exact_boxed/acc/mean@1",
+                    "val-core/numina_aops_forum/reward/mean@1",
+                ):
+                    if key in val_metrics:
+                        score = val_metrics[key]
+                        break
+                else:
+                    raise ValueError(
+                        "None of the required val-core metrics found for best‐ckpt"
+                    )
+                assert score is not None, "Score should not be None"
+                self.best_score = score
+            else:
+                self.best_score = None
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
